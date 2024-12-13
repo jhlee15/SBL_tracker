@@ -2,7 +2,7 @@
 
 import numpy as np
 from collections import deque
-
+import ultralytics
 from boxmot.motion.kalman_filters.xyah_kf import KalmanFilterXYAH
 from boxmot.trackers.bytetrack.basetrack import BaseTrack, TrackState
 from boxmot.utils.matching import fuse_score, iou_distance, linear_assignment
@@ -138,6 +138,8 @@ class ByteTrack(BaseTracker):
         self.active_tracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
         self.removed_stracks = []  # type: list[STrack]
+        self.equip_info = {}
+        self.reset_id()
 
         self.frame_id = 0
         self.track_buffer = track_buffer
@@ -150,11 +152,74 @@ class ByteTrack(BaseTracker):
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilterXYAH()
 
+    def categories(self, cat_id) :
+        cat = {0:"person",1:"hat",2:"glasses",3:"face_shield",4:"mask",5:"gloves",6:"suit",7:"boots",8:"integ"}
+        cats = cat[cat_id]
+        return cats
+        
+    # Track이 생성될때 실행 update 쪽에서 함수를 호출해 주면 된다.     
+    def insert_equip_info(self, track_id):
+        self.equip_info[track_id] = {"hat":False,"face_shield":False,"suit":False,"gloves":False,
+                                      "mask":False,"boots":False,"glasses":False,"integ":False}
+
+
+    # Track이 remove될때 실행 update 쪽에서 함수를 호출해 주면 된다.
+    def remove_equip_info(self, track_id):
+        self.equip_info.pop(track_id, None)
+
+    # update 함수 이전이나 이후에 외부에서 함수를 호출해 착용 여부를 줄 수 있다.
+    def track_set_equip(self, track_id, equipment):
+        if equipment == 'integ' :
+            self.equip_info[track_id]['hat'] = True
+            self.equip_info[track_id]['face_shield'] = True
+        else :
+            self.equip_info[track_id][equipment] = True
+            
+    def overlap_equipment(self, cls, bboxes, xresult):          
+        
+        iou_matrix = []
+        skip = False
+        for i in range(len(xresult)):
+            for j in range(i + 1, len(xresult)):
+                iou = IoU(xresult[i][:4], xresult[j][:4])
+                if iou > 0:
+                    skip = True
+                    break
+            if skip:
+                break
+
+        if not skip:
+            # Calculate IOUs between xresult boxes and all_box excluding cls 0
+            for x_box in xresult:
+                track_id = int(x_box[4])
+                for j, bbox in enumerate(bboxes):
+                    if cls[j] != 0:
+                        iou = IoU(x_box[:4], bbox)
+                        if iou > 0:
+                            iou_matrix.append([track_id, cls[j], iou])
+            
+        for i in iou_matrix :
+            i[1] = self.categories(i[1])
+            
+        result_dict = {}
+        for item in iou_matrix:
+            if item[2] > 0:
+                key = item[0]
+                if key not in result_dict:
+                    result_dict[key] = []
+                result_dict[key].append(item[1])
+                
+        return result_dict           
+        
+                   
     @BaseTracker.on_first_frame_setup
     @BaseTracker.per_class_decorator
-    def update(self, dets: np.ndarray, img: np.ndarray = None, embs: np.ndarray = None) -> np.ndarray:
+    def update(self, dets, img: np.ndarray = None, embs: np.ndarray = None) -> np.ndarray:
         
-        self.check_inputs(dets, img)
+        if isinstance(dets, ultralytics.engine.results.Boxes):
+            dets = dets.data
+        else :
+            self.check_inputs(dets, img)
 
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
         self.frame_count += 1
@@ -163,6 +228,18 @@ class ByteTrack(BaseTracker):
         lost_stracks = []
         removed_stracks = []
         confs = dets[:, 4]
+        
+        _bboxes = dets[:,:4]
+        _cls = dets[:,5]
+
+        self.det_result = [i[:5] + [self.categories(int(i[5]))] for i in dets.tolist()]
+               
+        person_idx = [i for i,j in enumerate(_cls) if j == 0]
+        confs = [confs[i] for i in person_idx]
+        dets = [dets[i] for i in person_idx]
+        
+        dets = np.array(dets)
+        confs = np.array(confs)
 
         remain_inds = confs > self.track_thresh
 
@@ -267,6 +344,10 @@ class ByteTrack(BaseTracker):
             if self.frame_count - track.end_frame > self.max_time_lost:
                 track.mark_removed()
                 removed_stracks.append(track)
+                # remove equip info
+                track_id = [str(int(i.id)) for i in removed_stracks]
+                for t_idx in track_id :
+                    self.remove_equip_info(t_idx)
 
         self.active_tracks = [
             t for t in self.active_tracks if t.state == TrackState.Tracked
@@ -280,6 +361,10 @@ class ByteTrack(BaseTracker):
         self.active_tracks, self.lost_stracks = remove_duplicate_stracks(
             self.active_tracks, self.lost_stracks
         )
+        
+        if len(self.removed_stracks) > 1000:
+            self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
+        
         # get confs of lost tracks
         output_stracks = [track for track in self.active_tracks if track.is_activated]
         outputs = []
@@ -292,11 +377,42 @@ class ByteTrack(BaseTracker):
             output.append(t.det_ind)
             outputs.append(output)
         outputs = np.asarray(outputs)
+
+        track_id = [str(int(t.id)) for t in output_stracks if track.is_activated]
+        for t_idx in track_id :
+            self.insert_equip_info(t_idx)
+            
+        result_dict = self.overlap_equipment(_cls, _bboxes, outputs)
+        if result_dict :
+            for e_id, equip in result_dict.items() :
+                for eq in equip : 
+                    self.track_set_equip(str(e_id), eq) 
+                    
         return outputs
+    
+    def equip_info(self) :
+        return self.equip_info
+    
+    def det_result(self) :
+        return self.det_result
+    
+    @staticmethod
+    def reset_id():
+        """Resets the ID counter of STrack."""
+        STrack.clear_count()
 
+    def rest_equip(self):
+        self.equip_info = {}
 
-# id, class_id, conf
-
+    def reset(self):
+        """Reset tracker."""
+        self.tracked_stracks = []
+        self.lost_stracks = [] 
+        self.removed_stracks = [] 
+        self.frame_id = 0
+        self.kalman_filter = KalmanFilterXYAH()
+        self.equip_info = {}
+        self.reset_id()
 
 def joint_stracks(tlista, tlistb):
     exists = {}
@@ -337,3 +453,25 @@ def remove_duplicate_stracks(stracksa, stracksb):
     resa = [t for i, t in enumerate(stracksa) if i not in dupa]
     resb = [t for i, t in enumerate(stracksb) if i not in dupb]
     return resa, resb
+
+def IoU(box1, box2):
+    x1_min, y1_min, x1_max, y1_max = box1
+    x2_min, y2_min, x2_max, y2_max = box2
+
+    inter_x_min = max(x1_min, x2_min)
+    inter_y_min = max(y1_min, y2_min)
+    inter_x_max = min(x1_max, x2_max)
+    inter_y_max = min(y1_max, y2_max)
+
+    if (inter_x_min < inter_x_max) and (inter_y_min < inter_y_max):
+        intersection_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+    else:
+        return 0
+
+    box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+    box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+
+    union_area = box1_area + box2_area - intersection_area
+    iou = intersection_area / union_area
+   
+    return iou
