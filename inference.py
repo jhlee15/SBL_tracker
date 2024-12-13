@@ -83,6 +83,9 @@ while True:
     
     # detection results per frame
     det_result = tracker.det_result
+
+    # reset tracker
+    # tracker.reset()
     
     # print(f"tracking_data:{tracking_data}")
     print(f"equip_info : {tracker.equip_info}")
