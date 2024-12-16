@@ -1,3 +1,12 @@
+# SBL Tracker 
+## 추론 정보 파일
+config.yaml
+
+## 추론 실행
+```bash
+$ python inference.py
+```
+
 # BoxMOT: pluggable SOTA tracking modules for segmentation, object detection and pose estimation models
 
 <div align="center">
